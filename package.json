@@ -3,15 +3,19 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
   "scripts": {
     "dev": "bash ./run.sh",
-    "dev:all": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\"",
-    "dev:frontend": "cd frontend && npm run dev",
-    "dev:backend": "cd backend && npm run dev",
-    "build": "cd frontend && npm run build",
+    "dev:all": "concurrently \"npm run dev --workspace frontend\" \"npm run dev --workspace backend\"",
+    "dev:frontend": "npm run dev --workspace frontend",
+    "dev:backend": "npm run dev --workspace backend",
+    "build": "npm run build --workspace frontend",
     "start": "node backend/index.js",
-    "start:frontend": "cd frontend && npm run preview",
-    "start:backend": "cd backend && npm run start"
+    "start:frontend": "npm run preview --workspace frontend",
+    "start:backend": "npm run start --workspace backend"
   },
   "dependencies": {
     "concurrently": "^8.2.0"

@@ -18,19 +18,32 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const isDirectExecution = process.argv[1] && path.resolve(process.argv[1]) === __filename;
 dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
+const publicDir = path.resolve(__dirname, "../public");
 const frontendDistDir = path.resolve(__dirname, "../frontend/dist");
-const hasFrontendDist = fs.existsSync(frontendDistDir);
+const frontendStaticDir = fs.existsSync(publicDir) ? publicDir : frontendDistDir;
+const hasFrontendStatic = fs.existsSync(frontendStaticDir);
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
-if (hasFrontendDist) {
-  app.use(express.static(frontendDistDir));
+if (hasFrontendStatic) {
+  app.use(express.static(frontendStaticDir));
 }
 
-const dbFile = path.join(__dirname, "db.json");
+const bundledDbFile = path.join(__dirname, "db.json");
+const dbFile = process.env.VERCEL ? path.join("/tmp", "kotiba-db.json") : bundledDbFile;
+
+if (process.env.VERCEL && !fs.existsSync(dbFile)) {
+  if (fs.existsSync(bundledDbFile)) {
+    fs.copyFileSync(bundledDbFile, dbFile);
+  } else {
+    fs.writeFileSync(dbFile, JSON.stringify({ tasks: [], reminders: [], expenses: [] }, null, 2));
+  }
+}
+
 const adapter = new JSONFile(dbFile);
 const db = new Low(adapter);
 
@@ -1081,18 +1094,22 @@ app.get("*", (req, res, next) => {
     return next();
   }
 
-  if (hasFrontendDist) {
-    return res.sendFile(path.join(frontendDistDir, "index.html"));
+  if (hasFrontendStatic) {
+    return res.sendFile(path.join(frontendStaticDir, "index.html"));
   }
 
   return res.status(404).json({ error: "Frontend build topilmadi. `npm run build` ni ishga tushiring." });
 });
 
-const server = app.listen(port, host, () => {
-  console.log(`Backend running on http://${host}:${port}`);
-});
+if (isDirectExecution) {
+  const server = app.listen(port, host, () => {
+    console.log(`Backend running on http://${host}:${port}`);
+  });
 
-server.on("error", (err) => {
-  console.error(`Backend listen xatoligi (${host}:${port})`, err);
-  process.exit(1);
-});
+  server.on("error", (err) => {
+    console.error(`Backend listen xatoligi (${host}:${port})`, err);
+    process.exit(1);
+  });
+}
+
+export default app;
