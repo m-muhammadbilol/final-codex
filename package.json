@@ -1,0 +1,19 @@
+{
+  "name": "uzbek-ai-secretary",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bash ./run.sh",
+    "dev:all": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\"",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:backend": "cd backend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "start": "node backend/index.js",
+    "start:frontend": "cd frontend && npm run preview",
+    "start:backend": "cd backend && npm run start"
+  },
+  "dependencies": {
+    "concurrently": "^8.2.0"
+  }
+}
