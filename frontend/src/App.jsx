@@ -100,6 +100,28 @@ function getSpeechRecognitionConstructor() {
   return window.SpeechRecognition || window.webkitSpeechRecognition || null;
 }
 
+function getSupportedRecorderMimeType() {
+  if (typeof window === "undefined" || typeof MediaRecorder === "undefined" || typeof MediaRecorder.isTypeSupported !== "function") {
+    return "";
+  }
+
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4",
+    "audio/mp4;codecs=mp4a.40.2",
+    "audio/ogg;codecs=opus"
+  ];
+
+  return candidates.find((item) => MediaRecorder.isTypeSupported(item)) || "";
+}
+
+function getAudioExtensionFromMimeType(mimeType = "") {
+  if (/mp4|aac|m4a/i.test(mimeType)) return "m4a";
+  if (/ogg/i.test(mimeType)) return "ogg";
+  return "webm";
+}
+
 function isRecoverableVoiceServiceError(message = "") {
   return /insufficient funds|bulut|browser|failed \((401|402|403|429|5\d\d)\)/i.test(String(message));
 }
@@ -436,6 +458,7 @@ function App() {
   const speechRecognitionErrorRef = useRef("");
   const browserSpeechUnavailableRef = useRef(false);
   const browserSpeechUnavailableReasonRef = useRef("");
+  const recordingMimeTypeRef = useRef("");
 
   useEffect(() => {
     getTasks();
@@ -1291,19 +1314,30 @@ function App() {
       setErrorMessage("");
       shouldSendRecordingRef.current = false;
 
-       const startedWithBrowser = await startBrowserSpeechRecognition();
-       if (startedWithBrowser) {
-         return;
-       }
+      if (typeof MediaRecorder === "undefined") {
+        const startedWithBrowser = await startBrowserSpeechRecognition();
+        if (startedWithBrowser) {
+          return;
+        }
+
+        throw new Error("Bu brauzer audio yozishni qo'llamaydi.");
+      }
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       recordingStreamRef.current = stream;
-      const recorder = new MediaRecorder(stream);
+      const mimeType = getSupportedRecorderMimeType();
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
       recordingChunksRef.current = [];
+      recordingMimeTypeRef.current = recorder.mimeType || mimeType || "";
       voiceCaptureModeRef.current = "upload";
 
       recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) recordingChunksRef.current.push(event.data);
+        if (event.data.size > 0) {
+          if (event.data.type) {
+            recordingMimeTypeRef.current = event.data.type;
+          }
+          recordingChunksRef.current.push(event.data);
+        }
       };
 
       recorder.onstop = async () => {
@@ -1319,10 +1353,12 @@ function App() {
 
         setStatus("thinking");
 
-        const blob = new Blob(recordingChunksRef.current, { type: "audio/webm" });
+        const audioMimeType = recordingMimeTypeRef.current || recordingChunksRef.current[0]?.type || "audio/webm";
+        const fileExtension = getAudioExtensionFromMimeType(audioMimeType);
+        const blob = new Blob(recordingChunksRef.current, { type: audioMimeType });
         recordingChunksRef.current = [];
         const form = new FormData();
-        form.append("audio", blob, "voice.webm");
+        form.append("audio", blob, `voice.${fileExtension}`);
 
         try {
           const sttResp = await fetch(`${API_BASE}/stt`, { method: "POST", body: form });

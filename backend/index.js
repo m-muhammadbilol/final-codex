@@ -12,6 +12,7 @@ import FormData from "form-data";
 import { v4 as uuidv4 } from "uuid";
 import {
   KOTIBA_BASE_SYSTEM_PROMPT,
+  KOTIBA_UNDERSTANDING_SYSTEM_PROMPT,
   KOTIBA_DESIGN_SYSTEM_PROMPT,
   isDesignOrProductRequest,
 } from "./prompts/kotiba-system-prompt.js";
@@ -256,6 +257,159 @@ function parseIntegerEnv(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function normalizeReminderRepeatValue(repeat = "none") {
+  if (repeat === "daily") return String(24 * 60);
+  if (repeat === "weekly") return String(7 * 24 * 60);
+  if (repeat === "monthly") return String(30 * 24 * 60);
+  return null;
+}
+
+function combineStructuredDateTime(dateText = null, timeText = null) {
+  if (!dateText && !timeText) return null;
+
+  const now = new Date();
+  const baseDate = dateText ? new Date(`${dateText}T00:00:00`) : new Date(now);
+  if (Number.isNaN(baseDate.getTime())) return null;
+
+  if (timeText) {
+    const match = String(timeText).match(/^(\d{2}):(\d{2})$/);
+    if (!match) return null;
+    baseDate.setHours(Number(match[1]), Number(match[2]), 0, 0);
+  } else {
+    baseDate.setHours(9, 0, 0, 0);
+  }
+
+  if (!dateText && timeText && baseDate.getTime() <= now.getTime()) {
+    baseDate.setDate(baseDate.getDate() + 1);
+  }
+
+  return baseDate.toISOString();
+}
+
+function buildExpenseTitleFromStructuredItem(item = {}, fallbackText = "") {
+  const normalizedText = item.text?.trim() || item.normalized_text?.trim();
+  if (normalizedText) return normalizedText;
+
+  const categoryTitles = {
+    food: "Ovqat xarajati",
+    transport: "Transport xarajati",
+    shopping: "Xarid xarajati",
+    bills: "To'lov xarajati",
+    health: "Sog'liq xarajati",
+    education: "Ta'lim xarajati",
+    other: "Xarajat"
+  };
+
+  if (item.category && categoryTitles[item.category]) {
+    return categoryTitles[item.category];
+  }
+
+  return buildExpenseTitle(fallbackText);
+}
+
+function inferBackendIntentFromStructuredItem(item = {}) {
+  switch (item.intent) {
+    case "meeting":
+    case "reminder":
+      return "reminder_create";
+    case "task":
+      return "task_create";
+    case "expense":
+      return "expense_create";
+    case "chat":
+    case "note":
+    default:
+      return "general_chat";
+  }
+}
+
+function buildActionsFromStructuredItems(items = [], fallbackText = "") {
+  const actions = [];
+
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+
+    if (item.needs_clarification) {
+      return {
+        needClarification: item.clarification_question || "Iltimos, biroz aniqlashtiring."
+      };
+    }
+
+    const itemText = item.text?.trim() || item.normalized_text?.trim() || fallbackText.trim();
+    const itemIntent = item.intent || "chat";
+
+    if (itemIntent === "meeting" || itemIntent === "reminder") {
+      if (!item.date && !item.time) {
+        return { needClarification: item.clarification_question || "Qachon eslatay?" };
+      }
+
+      if (!item.time) {
+        return { needClarification: item.clarification_question || "Qaysi vaqtda eslatay?" };
+      }
+
+      const isoTime = combineStructuredDateTime(item.date, item.time);
+      if (!isoTime) {
+        return { needClarification: item.clarification_question || "Qaysi vaqtda eslatay?" };
+      }
+
+      actions.push({
+        type: "reminder_create",
+        payload: {
+          id: uuidv4(),
+          title: itemText || "Eslatma",
+          time: isoTime,
+          repeat: normalizeReminderRepeatValue(item.repeat)
+        }
+      });
+      continue;
+    }
+
+    if (itemIntent === "task") {
+      if (!itemText) {
+        return { needClarification: item.clarification_question || "Vazifa nomini ayting." };
+      }
+
+      actions.push({
+        type: "task_create",
+        payload: {
+          id: uuidv4(),
+          title: itemText,
+          completed: item.status === "done",
+          createdAt: new Date().toISOString(),
+          priority: item.priority || null
+        }
+      });
+      continue;
+    }
+
+    if (itemIntent === "expense") {
+      if (!Number.isFinite(Number(item.amount))) {
+        return { needClarification: item.clarification_question || "Qancha xarajat qilganingizni ayting." };
+      }
+
+      const occurredAt = combineStructuredDateTime(item.date, item.time) || new Date().toISOString();
+      actions.push({
+        type: "expense_create",
+        payload: {
+          id: uuidv4(),
+          title: buildExpenseTitleFromStructuredItem(item, fallbackText),
+          amount: Number(item.amount),
+          currency: item.currency === "USD" ? "USD" : "UZS",
+          category: item.category || null,
+          occurredAt,
+          createdAt: new Date().toISOString(),
+          rawText: item.normalized_text?.trim() || fallbackText.trim()
+        }
+      });
+      continue;
+    }
+  }
+
+  if (actions.length === 1) return actions[0];
+  if (actions.length > 1) return { type: "multi_action", actions };
+  return null;
+}
+
 function buildGeminiSystemInstruction(text) {
   const designMode = isDesignOrProductRequest(text);
   const promptSections = [KOTIBA_BASE_SYSTEM_PROMPT];
@@ -263,6 +417,8 @@ function buildGeminiSystemInstruction(text) {
 
   if (designMode) {
     promptSections.push(KOTIBA_DESIGN_SYSTEM_PROMPT);
+  } else {
+    promptSections.push(KOTIBA_UNDERSTANDING_SYSTEM_PROMPT);
   }
 
   if (appendPrompt) {
@@ -274,7 +430,9 @@ Texnik javob formati:
 - Har doim faqat bitta JSON obyekt qaytaring.
 - replyText foydalanuvchiga ko'rinadigan yakuniy matn bo'lsin.
 - intent faqat quyidagi qiymatlardan biri bo'lsin: general_chat, time_check, date_check, task_create, task_list, task_complete, reminder_create, reminder_list, agenda_today, agenda_tomorrow, expense_create, expense_list, expense_summary_today, expense_summary_week, expense_summary_month.
-- action null yoki kichik obyekt bo'lsin.
+- action null yoki obyekt bo'lsin.
+- Agar operatsion buyruq bo'lsa, action.items ichida ajratilgan itemlarni bering.
+- action.items ichidagi intentlar faqat: reminder, task, meeting, expense, note, chat.
 - Agar foydalanuvchi dizayn, product strategy, UI/UX yoki app structure haqida so'rasa, intent="general_chat" va action=null ishlating.
 - Agar foydalanuvchi task yoki eslatma yaratmoqchi bo'lsa, intentni to'g'ri tanlang.
 - replyText qisqa bo'lishi shart emas; dizayn va product savollarida u batafsil va bo'limlarga ajratilgan bo'lishi mumkin.
@@ -385,6 +543,90 @@ async function keyToTextFromGemini(text) {
   try {
     const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
     const { designMode, systemInstruction } = buildGeminiSystemInstruction(text);
+    const structuredItemSchema = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        intent: {
+          type: "string",
+          enum: ["reminder", "task", "meeting", "expense", "note", "chat"]
+        },
+        text: { type: "string" },
+        normalized_text: { type: "string" },
+        date: {
+          anyOf: [
+            { type: "string" },
+            { type: "null" }
+          ]
+        },
+        time: {
+          anyOf: [
+            { type: "string" },
+            { type: "null" }
+          ]
+        },
+        repeat: {
+          type: "string",
+          enum: ["none", "daily", "weekly", "monthly"]
+        },
+        amount: {
+          anyOf: [
+            { type: "number" },
+            { type: "null" }
+          ]
+        },
+        currency: {
+          anyOf: [
+            { type: "string", enum: ["UZS", "USD"] },
+            { type: "null" }
+          ]
+        },
+        category: {
+          anyOf: [
+            {
+              type: "string",
+              enum: ["food", "transport", "shopping", "bills", "health", "education", "other"]
+            },
+            { type: "null" }
+          ]
+        },
+        status: {
+          type: "string",
+          enum: ["pending", "done"]
+        },
+        priority: {
+          anyOf: [
+            { type: "string", enum: ["low", "medium", "high"] },
+            { type: "null" }
+          ]
+        },
+        needs_clarification: { type: "boolean" },
+        clarification_question: {
+          anyOf: [
+            { type: "string" },
+            { type: "null" }
+          ]
+        },
+        confidence: { type: "number" }
+      },
+      required: [
+        "intent",
+        "text",
+        "normalized_text",
+        "date",
+        "time",
+        "repeat",
+        "amount",
+        "currency",
+        "category",
+        "status",
+        "priority",
+        "needs_clarification",
+        "clarification_question",
+        "confidence"
+      ]
+    };
+
     const responseSchema = {
       type: "object",
       additionalProperties: false,
@@ -420,7 +662,11 @@ async function keyToTextFromGemini(text) {
                 type: { type: "string" },
                 title: { type: "string" },
                 timeText: { type: "string" },
-                repeat: { type: "string" }
+                repeat: { type: "string" },
+                items: {
+                  type: "array",
+                  items: structuredItemSchema
+                }
               }
             }
           ]
@@ -485,7 +731,13 @@ async function keyToTextFromGemini(text) {
 async function sendToGeminiEcho(text) {
   try {
     const parsed = await keyToTextFromGemini(text);
-    if (parsed && parsed.replyText) return parsed;
+    if (parsed && parsed.replyText) {
+      if ((!parsed.intent || parsed.intent === "general_chat") && Array.isArray(parsed.action?.items) && parsed.action.items.length > 0) {
+        parsed.intent = inferBackendIntentFromStructuredItem(parsed.action.items[0]);
+      }
+
+      return parsed;
+    }
 
     // fallback heuristic if Gemini doesn't return expected format
     const heuristic = { replyText: "Hmm, so'rovni tushunmadim, iltimos qaytadan so'rang.", intent: "general_chat", action: null };
@@ -557,8 +809,19 @@ async function sendToGeminiEcho(text) {
   }
 }
 
-async function buildActionFromIntent(parsedIntent, text) {
+async function buildActionFromIntent(parsedIntent, text, geminiAction = null) {
   const normalized = normalizeUzbekText(text);
+  if (geminiAction?.items?.length) {
+    const structured = buildActionsFromStructuredItems(geminiAction.items, text);
+    if (structured?.needClarification) {
+      return structured;
+    }
+
+    if (structured) {
+      return structured;
+    }
+  }
+
   if (parsedIntent === "task_create" || /\btask\b/.test(normalized) || /\bvazifa\b/.test(normalized)) {
     const description = text
       .replace(/.*?(?:task|vazifa)\s*(?:qo['’`‘ʻ]?sh|qosh|qoʻsh)?\s*:?\s*/i, "")
@@ -667,8 +930,138 @@ async function buildActionFromIntent(parsedIntent, text) {
   return { type: "general_chat" };
 }
 
+async function executeActionPlan(actionPlan, geminiReplyText = "") {
+  let actionResult = null;
+  let uiResponse = null;
+  let replyText = geminiReplyText;
+
+  switch (actionPlan.type) {
+    case "multi_action": {
+      const results = [];
+      const mergedUi = {};
+
+      for (const singleAction of actionPlan.actions || []) {
+        const executed = await executeActionPlan(singleAction, geminiReplyText);
+        results.push({
+          type: singleAction.type,
+          actionResult: executed.actionResult
+        });
+
+        if (executed.uiResponse?.tasks) mergedUi.tasks = executed.uiResponse.tasks;
+        if (executed.uiResponse?.reminders) mergedUi.reminders = executed.uiResponse.reminders;
+        if (executed.uiResponse?.expenses) mergedUi.expenses = executed.uiResponse.expenses;
+        if (executed.uiResponse?.expenseSummary) mergedUi.expenseSummary = executed.uiResponse.expenseSummary;
+      }
+
+      actionResult = { items: results };
+      uiResponse = mergedUi;
+      break;
+    }
+    case "task_create": {
+      const task = actionPlan.payload;
+      await db.read();
+      db.data.tasks.push(task);
+      await db.write();
+      actionResult = { task };
+      uiResponse = { tasks: db.data.tasks };
+      break;
+    }
+    case "task_list": {
+      await db.read();
+      uiResponse = { tasks: db.data.tasks };
+      break;
+    }
+    case "task_complete": {
+      await db.read();
+      let target = null;
+      if (actionPlan.payload?.token === "first") {
+        target = db.data.tasks.find((t) => !t.completed);
+      }
+      if (target) {
+        target.completed = true;
+        await db.write();
+        actionResult = { task: target };
+        uiResponse = { tasks: db.data.tasks };
+      } else {
+        replyText = "Bajarilishi kerak bo‘lgan task topilmadi.";
+        uiResponse = { tasks: db.data.tasks };
+      }
+      break;
+    }
+    case "reminder_create": {
+      if (actionPlan.payload?.title && actionPlan.payload?.time) {
+        await db.read();
+        db.data.reminders.push(actionPlan.payload);
+        await db.write();
+        actionResult = { reminder: actionPlan.payload };
+        uiResponse = { reminders: db.data.reminders };
+      } else {
+        replyText = "Qaysi vaqtda eslatay?";
+      }
+      break;
+    }
+    case "reminder_list": {
+      await db.read();
+      uiResponse = { reminders: db.data.reminders };
+      break;
+    }
+    case "expense_create": {
+      await db.read();
+      db.data.expenses.push(actionPlan.payload);
+      await db.write();
+      actionResult = { expense: actionPlan.payload };
+      uiResponse = { expenses: db.data.expenses };
+      break;
+    }
+    case "expense_list": {
+      await db.read();
+      uiResponse = { expenses: db.data.expenses };
+      break;
+    }
+    case "expense_summary": {
+      await db.read();
+      const summary = summarizeExpenses(db.data.expenses, actionPlan.payload?.period || "today");
+      actionResult = { summary };
+      uiResponse = {
+        expenses: db.data.expenses,
+        expenseSummary: summary
+      };
+      replyText = buildExpenseSummaryText(summary);
+      break;
+    }
+    case "agenda_today": {
+      await db.read();
+      const today = new Date().toISOString().slice(0, 10);
+      const tasks = db.data.tasks;
+      const reminders = db.data.reminders.filter((r) => r.time && r.time.startsWith(today));
+      uiResponse = { agenda: { tasks, reminders } };
+      replyText = `Bugungi rejalar:
+- ${tasks.length} task
+- ${reminders.length} eslatma`;
+      break;
+    }
+    case "agenda_tomorrow": {
+      await db.read();
+      const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const reminders = db.data.reminders.filter((r) => r.time && r.time.startsWith(tomorrow));
+      uiResponse = { agenda: { reminders } };
+      replyText = `Ertaga reja:
+- ${reminders.length} eslatma`;
+      break;
+    }
+    default: {
+      uiResponse = null;
+    }
+  }
+
+  return { actionResult, uiResponse, replyText };
+}
+
 function buildReplyFromAction(actionPlan, actionResult, uiResponse, fallbackReply) {
   switch (actionPlan.type) {
+    case "multi_action":
+      if (fallbackReply) return fallbackReply;
+      break;
     case "task_create":
       if (actionResult?.task) {
         return `Xo'p, "${actionResult.task.title}" vazifasini qo'shdim.`;
@@ -879,7 +1272,7 @@ app.get("/api/expenses", async (req, res) => {
 });
 
 app.post("/api/expenses", async (req, res) => {
-  const { title, amount, currency = "UZS", occurredAt } = req.body;
+  const { title, amount, currency = "UZS", occurredAt, category = null } = req.body;
   const numericAmount = Number(amount);
 
   if (!title || !Number.isFinite(numericAmount)) {
@@ -891,6 +1284,7 @@ app.post("/api/expenses", async (req, res) => {
     title: String(title),
     amount: numericAmount,
     currency: currency === "USD" ? "USD" : "UZS",
+    category: category || null,
     occurredAt: occurredAt ? new Date(occurredAt).toISOString() : new Date().toISOString(),
     createdAt: new Date().toISOString(),
     rawText: String(title)
@@ -947,7 +1341,7 @@ app.post("/api/assistant", async (req, res) => {
       return res.status(500).json({ replyText: "Xatolik yuz berdi. Iltimos, qayta urinib ko‘ring.", action: null });
     }
 
-    const actionPlan = await buildActionFromIntent(gemini.intent, text);
+    const actionPlan = await buildActionFromIntent(gemini.intent, text, gemini.action);
     if (actionPlan.needClarification) {
       return res.json({
         replyText: actionPlan.needClarification,
@@ -957,108 +1351,10 @@ app.post("/api/assistant", async (req, res) => {
       });
     }
 
-    let actionResult = null;
-    let uiResponse = null;
-
-    // Handle action plan
-    switch (actionPlan.type) {
-      case "task_create": {
-        const task = actionPlan.payload;
-        await db.read();
-        db.data.tasks.push(task);
-        await db.write();
-        actionResult = { task };
-        uiResponse = { tasks: db.data.tasks };
-        break;
-      }
-      case "task_list": {
-        await db.read();
-        uiResponse = { tasks: db.data.tasks };
-        break;
-      }
-      case "task_complete": {
-        await db.read();
-        let target = null;
-        if (actionPlan.payload?.token === "first") {
-          target = db.data.tasks.find((t) => !t.completed);
-        }
-        if (target) {
-          target.completed = true;
-          await db.write();
-          actionResult = { task: target };
-          uiResponse = { tasks: db.data.tasks };
-        } else {
-          gemini.replyText = "Bajarilishi kerak bo‘lgan task topilmadi.";
-          uiResponse = { tasks: db.data.tasks };
-        }
-        break;
-      }
-      case "reminder_create": {
-        if (actionPlan.payload?.title && actionPlan.payload?.time) {
-          await db.read();
-          db.data.reminders.push(actionPlan.payload);
-          await db.write();
-          actionResult = { reminder: actionPlan.payload };
-          uiResponse = { reminders: db.data.reminders };
-        } else {
-          gemini.replyText = "Qaysi vaqtda eslatay?";
-        }
-        break;
-      }
-      case "reminder_list": {
-        await db.read();
-        uiResponse = { reminders: db.data.reminders };
-        break;
-      }
-      case "expense_create": {
-        await db.read();
-        db.data.expenses.push(actionPlan.payload);
-        await db.write();
-        actionResult = { expense: actionPlan.payload };
-        uiResponse = { expenses: db.data.expenses };
-        break;
-      }
-      case "expense_list": {
-        await db.read();
-        uiResponse = { expenses: db.data.expenses };
-        break;
-      }
-      case "expense_summary": {
-        await db.read();
-        const summary = summarizeExpenses(db.data.expenses, actionPlan.payload?.period || "today");
-        actionResult = { summary };
-        uiResponse = {
-          expenses: db.data.expenses,
-          expenseSummary: summary
-        };
-        gemini.replyText = buildExpenseSummaryText(summary);
-        break;
-      }
-      case "agenda_today": {
-        await db.read();
-        const today = new Date().toISOString().slice(0, 10);
-        const tasks = db.data.tasks;
-        const reminders = db.data.reminders.filter((r) => r.time && r.time.startsWith(today));
-        uiResponse = { agenda: { tasks, reminders } };
-        gemini.replyText = `Bugungi rejalar:
-- ${tasks.length} task
-- ${reminders.length} eslatma`; 
-        break;
-      }
-      case "agenda_tomorrow": {
-        await db.read();
-        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-        const reminders = db.data.reminders.filter((r) => r.time && r.time.startsWith(tomorrow));
-        uiResponse = { agenda: { reminders } };
-        gemini.replyText = `Ertaga reja:
-- ${reminders.length} eslatma`; 
-        break;
-      }
-      default: {
-        // general chat
-        uiResponse = null;
-      }
-    }
+    const executed = await executeActionPlan(actionPlan, gemini.replyText);
+    const actionResult = executed.actionResult;
+    const uiResponse = executed.uiResponse;
+    gemini.replyText = executed.replyText;
 
     const replyText = buildReplyFromAction(actionPlan, actionResult, uiResponse, gemini.replyText);
     res.json({ replyText, intent: gemini.intent, uiResponse, actionResult });
